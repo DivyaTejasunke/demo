@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Earth Data Explorer — 1D / 2D / 3D + Search</title>
+  <style>
+    :root { --bg: #0b1020; --panel: #121a33; --text: #e8ecff; --accent: #7aa2ff; --danger: #ff6b6b;}
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: ui-sans-serif, system-ui; }
+    header { padding: 12px 18px; background: #0e1430; border-bottom: 1px solid rgba(255,255,255,.1);}
+    header h1 { font-size: 18px; margin: 0; font-weight: 700; }
+    .wrap { display: grid; grid-template-columns: 300px 1fr; gap: 12px; padding: 12px; }
+    @media (max-width: 960px){ .wrap { grid-template-columns: 1fr; } }
+    .panel { background: var(--panel); border: 1px solid rgba(255,255,255,.06); border-radius: 12px; padding: 12px; }
+    h2 { font-size: 15px; margin-top: 12px; margin-bottom: 6px; }
+    .btns { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+    button { border: 1px solid rgba(255,255,255,.2); background: #1a2448; color: var(--text); padding: 6px 10px; border-radius: 8px; cursor: pointer;}
+    button:hover { border-color: rgba(255,255,255,.4);}
+    input, select { width: 100%; margin: 3px 0 6px; padding: 6px; border: 1px solid rgba(255,255,255,.2); border-radius: 6px; background: #0f1733; color: var(--text);}
+    canvas { width: 100%; height: 80vh; border-radius: 12px; border: 1px solid rgba(255,255,255,.06); background:#000; }
+    #strip { height: 200px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Earth Data Explorer — 1D / 2D / 3D + Search</h1>
+  </header>
+  <div class="wrap">
+    <section class="panel">
+      <h2>1) View Modes</h2>
+      <div class="btns">
+        <button id="btn3D">3D Globe</button>
+        <button id="btn2D">2D Map</button>
+        <button id="btn1D">1D Strip</button>
+      </div>
+      <label>2D Projection</label>
+      <select id="projection">
+        <option value="equirect">Equirectangular</option>
+        <option value="mercator">Mercator</option>
+      </select>
+      <h2>2) NASA Layers</h2>
+      <div class="btns">
+        <button id="btnTemp">+ Land Temp</button>
+        <button id="btnFire">+ Fires</button>
+        <button id="btnClearWms">Clear</button>
+      </div>
+      <h2>3) CSV → GeoJSON</h2>
+      <input type="file" id="csvFile" accept=".csv" />
+      <input id="lat" type="text" placeholder="lat column" />
+      <input id="lon" type="text" placeholder="lon column" />
+      <input id="alt" type="text" placeholder="alt (optional)" />
+      <input id="nameCol" type="text" placeholder="name (optional)" />
+      <div class="btns">
+        <button id="btnPlot">Plot</button>
+        <button id="btnDownload">Download</button>
+        <button id="btnClearData">Clear</button>
+        <button id="btnDemo">Demo CSV</button>
+        <button id="btnDistances">Show Distances</button>
+      </div>
+      <h2>4) Go to Location</h2>
+      <input type="text" id="gotoInput" placeholder="e.g. 28.6,77.2 or 'New Delhi'" />
+      <div class="btns">
+        <button id="btnGoto">Go To</button>
+        <button id="btnClearPins">Clear Pins</button>
+      </div>
+    </section>
+    <section>
+      <canvas id="globe"></canvas>
+      <canvas id="strip" style="display:none"></canvas>
+    </section>
+  </div>
+  <!-- Libraries -->
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
+  <script src="https://files.worldwind.arc.nasa.gov/artifactory/web/0.11.0/worldwind.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script>
+    var wwd = new WorldWind.WorldWindow("globe");
+    wwd.addLayer(new WorldWind.BMNGLandsatLayer());
+    wwd.addLayer(new WorldWind.CompassLayer());
+    wwd.addLayer(new WorldWind.CoordinatesDisplayLayer(wwd));
+    wwd.addLayer(new WorldWind.ViewControlsLayer(wwd));
+    var dataLayer = new WorldWind.RenderableLayer("Data");
+    wwd.addLayer(dataLayer);
+
+    function set3D(){ globeCanvas(); wwd.globe=new WorldWind.Globe(new WorldWind.EarthElevationModel()); wwd.redraw(); }
+    function set2D(){ globeCanvas(); var g2d=new WorldWind.Globe2D(); g2d.elevationModel=new WorldWind.EarthElevationModel(); wwd.globe=g2d; setProjection(projection.value); }
+    function setProjection(kind){
+      if(!(wwd.globe instanceof WorldWind.Globe2D)) return;
+      wwd.projection = (kind==='mercator') ? new WorldWind.ProjectionMercator() : new WorldWind.ProjectionEquirectangular();
+      wwd.redraw();
+    }
+    function set1D(){ document.getElementById('globe').style.display='none'; document.getElementById('strip').style.display='block'; drawStrip(); }
+    function globeCanvas(){ document.getElementById('globe').style.display='block'; document.getElementById('strip').style.display='none'; }
+    btn3D.onclick=set3D; btn2D.onclick=set2D; btn1D.onclick=set1D; projection.onchange=e=>setProjection(e.target.value);
+
+    // NASA GIBS with required TIME param
+    var nasaLayers = [];
+    function addGibsWmsLayer(layerName, displayName){
+      var date = new Date().toISOString().slice(0,10);
+      var wmsUrl = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi";
+      var layer = new WorldWind.WmsLayer({
+        service: wmsUrl,
+        layerNames: layerName,
+        time: date,
+        title: displayName,
+        format: "image/png",
+        coordinateSystem: "EPSG:4326",
+        transparent: true
+      });
+      wwd.addLayer(layer);
+      nasaLayers.push(layer);
+      wwd.redraw();
+    }
+    btnTemp.onclick = () => addGibsWmsLayer("MODIS_Terra_Land_Surface_Temp_Day", "Land Temp");
+    btnFire.onclick = () => addGibsWmsLayer("MODIS_Terra_Thermal_Anomalies_Day", "Fires");
+    btnClearWms.onclick = function(){
+      nasaLayers.forEach(layer => wwd.removeLayer(layer));
+      nasaLayers = [];
+      wwd.redraw();
+    };
+
+    // CSV to GeoJSON parsing
+    function csvToGeoJSON(rows, latKey, lonKey, altKey, nameKey){
+      return {
+        type: 'FeatureCollection',
+        features: rows.map(function(r, i){
+          if(!r || !(latKey in r) || !(lonKey in r)) {
+            console.warn("Skipping row " + i + ": missing required columns.", r);
+            return null;
+          }
+          var lat = parseFloat(r[latKey]);
+          var lon = parseFloat(r[lonKey]);
+          var alt = altKey && altKey in r && r[altKey]!=="" ? parseFloat(r[altKey]) : 0;
+          if(!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+          var props = {...r};
+          if(nameKey && r[nameKey]) props.__label = r[nameKey];
+          return {type:'Feature', geometry:{type:'Point', coordinates:[lon, lat, alt]}, properties: props};
+        }).filter(Boolean)
+      };
+    }
+    function renderGeoJSON(geojson){
+      var parser = new WorldWind.GeoJSONParser(geojson);
+      parser.load(null, function(g, p){
+        let cfg = {};
+        if(g.type === 'Point'){
+          let a = new WorldWind.PlacemarkAttributes(null);
+          a.imageScale = 0.6;
+          cfg.attributes = a;
+          if(p.__label) cfg.name = p.__label;
+        }
+        return cfg;
+      }, dataLayer);
+      wwd.redraw();
+      drawStrip();
+    }
+
+    var uploadedGeoJSON = null;
+    csvFile.onchange = function(e){
+      Papa.parse(e.target.files[0], {
+        header: true,
+        complete: function(r){
+          window._csvRows = r.data.filter(row => 
+            typeof row.lat !== "undefined" && row.lat !== "" &&
+            typeof row.lon !== "undefined" && row.lon !== ""
+          );
+          console.log("Parsed CSV rows:", window._csvRows);
+          document.getElementById('lat').value = "lat";
+          document.getElementById('lon').value = "lon";
+          document.getElementById('alt').value = "alt";
+          document.getElementById('nameCol').value = "name";
+          alert("CSV loaded. Columns: " + Object.keys(window._csvRows[0] || {}).join(", "));
+        }
+      });
+    };
+
+    btnPlot.onclick = function(){
+      if(!window._csvRows || window._csvRows.length === 0) return alert("No valid CSV rows loaded.");
+      uploadedGeoJSON = csvToGeoJSON(window._csvRows, "lat", "lon", "alt", "name");
+      if(uploadedGeoJSON.features.length === 0) return alert("No valid points found in CSV.");
+      renderGeoJSON(uploadedGeoJSON);
+    };
+
+    btnDownload.onclick = function(){
+      if(!uploadedGeoJSON) return alert("Nothing to download.");
+      var blob = new Blob([JSON.stringify(uploadedGeoJSON, null, 2)], {type: "application/geo+json"});
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "data.geojson";
+      a.click();
+    };
+
+    btnClearData.onclick = function(){
+      dataLayer.removeAllRenderables();
+      wwd.redraw();
+      drawStrip();
+    };
+
+    btnDemo.onclick = function(){
+      var csv = "name,lat,lon\nDelhi,28.6,77.2\nChennai,13.08,80.27";
+      var res = Papa.parse(csv, {header: true});
+      window._csvRows = res.data;
+      uploadedGeoJSON = csvToGeoJSON(window._csvRows, "lat", "lon", "", "name");
+      renderGeoJSON(uploadedGeoJSON);
+    };
+
+    var strip = document.getElementById("strip");
+    var sctx = strip.getContext("2d");
+    function drawStrip(){
+      var W = strip.width = strip.clientWidth, H = strip.height = strip.clientHeight;
+      sctx.fillStyle = "#0b1020";
+      sctx.fillRect(0, 0, W, H);
+      sctx.strokeStyle = "rgba(255,255,255,0.2)";
+      sctx.beginPath();
+      sctx.moveTo(0, H - 20);
+      sctx.lineTo(W, H - 20);
+      sctx.stroke();
+      [0,90,180,270,360].forEach(deg => {
+        var x = (deg / 360) * W;
+        sctx.fillStyle = "rgba(255,255,255,0.6)";
+        sctx.fillRect(x - 0.5, H - 25, 1, 10);
+        sctx.fillText(deg + "°", x - 10, H - 5);
+      });
+      var longs = [];
+      dataLayer.renderables.forEach(r => {
+        if(r && r.position) longs.push((r.position.longitude + 360) % 360);
+      });
+      sctx.fillStyle = "#7aa2ff";
+      longs.forEach(lon => {
+        var x = (lon / 360) * W;
+        var y = 10 + Math.random() * (H - 40);
+        sctx.beginPath();
+        sctx.arc(x, y, 3, 0, 2 * Math.PI);
+        sctx.fill();
+      });
+      sctx.fillStyle = "#fff";
+      sctx.fillText(longs.length + " pts", 5, 12);
+    }
+
+    var markerLayer = new WorldWind.RenderableLayer("Markers");
+    wwd.addLayer(markerLayer);
+    function addMarker(lat, lon){
+      var placemark = new WorldWind.Placemark(new WorldWind.Position(lat, lon, 0), false, null);
+      var attrs = new WorldWind.PlacemarkAttributes(null);
+      attrs.imageScale = 1.2;
+      attrs.labelAttributes.color = WorldWind.Color.YELLOW;
+      attrs.imageSource = WorldWind.configuration.baseUrl + "images/pushpins/plain-red.png";
+      placemark.attributes = attrs;
+      placemark.label = lat.toFixed(2) + ", " + lon.toFixed(2);
+      markerLayer.addRenderable(placemark);
+      wwd.redraw();
+    }
+    btnGoto.onclick = function(){
+      var val = document.getElementById("gotoInput").value.trim();
+      if(!val) return;
+      function goTo(lat, lon){
+        var pos = new WorldWind.Position(lat, lon, 800e3);
+        wwd.goTo(pos);
+        addMarker(lat, lon);
+      }
+      if(val.match(/^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$/)){
+        var p = val.split(",");
+        goTo(parseFloat(p[0]), parseFloat(p[1]));
+      } else {
+        fetch("https://nominatim.openstreetmap.org/search?format=json&q=" + encodeURIComponent(val))
+          .then(r => r.json()).then(results => {
+            if(results && results.length > 0){ goTo(parseFloat(results[0].lat), parseFloat(results[0].lon)); }
+            else alert("Location not found: "+val);
+          }).catch(err => alert("Geocoding error: "+err));
+      }
+    };
+    btnClearPins.onclick = function(){
+      markerLayer.removeAllRenderables();
+      wwd.redraw();
+    };
+
+    function haversineDistance(lat1, lon1, lat2, lon2){
+      const R = 6371;
+      const toRad = deg => deg * Math.PI / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat / 2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2)**2;
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
+    btnDistances.onclick = function(){
+      if(!uploadedGeoJSON || uploadedGeoJSON.features.length<2){
+        alert("Need at least two points to calculate distances.");
+        return;
+      }
+      let output = "Distances Between Points:\n";
+      const features = uploadedGeoJSON.features;
+      for(let i=0; i<features.length-1; i++){
+        const p1 = features[i].geometry.coordinates;
+        const p2 = features[i+1].geometry.coordinates;
+        const name1 = features[i].properties.__label || `Point ${i+1}`;
+        const name2 = features[i+1].properties.__label || `Point ${i+2}`;
+        const dist = haversineDistance(p1[1], p1[0], p2[1], p2[0]);
+        output += `${name1} → ${name2}: ${dist.toFixed(2)} km\n`;
+      }
+      alert(output);
+    };
+  </script>
+</body>
+</html>
